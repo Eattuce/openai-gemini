@@ -1,43 +1,37 @@
 import { Buffer } from "node:buffer";
 
 export default {
-  async fetch (request) {
-    if (request.method === "OPTIONS") {
-      return handleOPTIONS();
-    }
-    const errHandler = (err) => {
-      console.error(err);
-      return new Response(err.message, fixCors({ status: err.status ?? 500 }));
-    };
+  async fetch(request) {
     try {
-      const auth = request.headers.get("Authorization");
-      const apiKey = auth?.split(" ")[1];
-      const assert = (success) => {
-        if (!success) {
-          throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
-        }
-      };
+      // 解析请求体
+      const requestBody = await request.json();
+      const apiKey = requestBody.api_key; // 从请求体中提取 api_key
+
+      // 检查 api_key 是否存在
+      if (!apiKey) {
+        return new Response("API key is required in the request body", {
+          status: 400,
+        });
+      }
+
+      // 根据路径路由请求
       const { pathname } = new URL(request.url);
       switch (true) {
         case pathname.endsWith("/chat/completions"):
-          assert(request.method === "POST");
-          return handleCompletions(await request.json(), apiKey)
-            .catch(errHandler);
+          return handleCompletions(requestBody, apiKey);
         case pathname.endsWith("/embeddings"):
-          assert(request.method === "POST");
-          return handleEmbeddings(await request.json(), apiKey)
-            .catch(errHandler);
+          return handleEmbeddings(requestBody, apiKey);
         case pathname.endsWith("/models"):
-          assert(request.method === "GET");
-          return handleModels(apiKey)
-            .catch(errHandler);
+          return handleModels(apiKey);
         default:
-          throw new HttpError("404 Not Found", 404);
+          return new Response("404 Not Found", { status: 404 });
       }
     } catch (err) {
-      return errHandler(err);
+      // 错误处理
+      console.error(err);
+      return new Response(err.message, { status: 500 });
     }
-  }
+  },
 };
 
 class HttpError extends Error {
@@ -60,7 +54,7 @@ const handleOPTIONS = async () => {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "*",
       "Access-Control-Allow-Headers": "*",
-    }
+    },
   });
 };
 
@@ -72,13 +66,14 @@ const API_CLIENT = "genai-js/0.21.0"; // npm view @google/generative-ai version
 const makeHeaders = (apiKey, more) => ({
   "x-goog-api-client": API_CLIENT,
   ...(apiKey && { "x-goog-api-key": apiKey }),
-  ...more
+  ...more,
 });
 
-async function handleModels (apiKey) {
+async function handleModels(apiKey) {
   const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
     headers: makeHeaders(apiKey),
   });
+
   let { body } = response;
   if (response.ok) {
     const { models } = JSON.parse(await response.text());
@@ -90,18 +85,18 @@ async function handleModels (apiKey) {
         created: 0,
         owned_by: "",
       })),
-    }, null, "  ");
+    });
   }
   return new Response(body, fixCors(response));
 }
 
 const DEFAULT_EMBEDDINGS_MODEL = "text-embedding-004";
-async function handleEmbeddings (req, apiKey) {
+async function handleEmbeddings(req, apiKey) {
   if (typeof req.model !== "string") {
     throw new HttpError("model is not specified", 400);
   }
   if (!Array.isArray(req.input)) {
-    req.input = [ req.input ];
+    req.input = [req.input];
   }
   let model;
   if (req.model.startsWith("models/")) {
@@ -110,17 +105,22 @@ async function handleEmbeddings (req, apiKey) {
     req.model = DEFAULT_EMBEDDINGS_MODEL;
     model = "models/" + req.model;
   }
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
-    method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify({
-      "requests": req.input.map(text => ({
-        model,
-        content: { parts: { text } },
-        outputDimensionality: req.dimensions,
-      }))
-    })
-  });
+
+  const response = await fetch(
+    `${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`,
+    {
+      method: "POST",
+      headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        requests: req.input.map((text) => ({
+          model,
+          content: { parts: { text } },
+          outputDimensionality: req.dimensions,
+        })),
+      }),
+    }
+  );
+
   let { body } = response;
   if (response.ok) {
     const { embeddings } = JSON.parse(await response.text());
@@ -132,15 +132,15 @@ async function handleEmbeddings (req, apiKey) {
         embedding: values,
       })),
       model: req.model,
-    }, null, "  ");
+    });
   }
   return new Response(body, fixCors(response));
 }
 
 const DEFAULT_MODEL = "gemini-1.5-pro-latest";
-async function handleCompletions (req, apiKey) {
+async function handleCompletions(req, apiKey) {
   let model = DEFAULT_MODEL;
-  switch(true) {
+  switch (true) {
     case typeof req.model !== "string":
       break;
     case req.model.startsWith("models/"):
@@ -150,32 +150,42 @@ async function handleCompletions (req, apiKey) {
     case req.model.startsWith("learnlm-"):
       model = req.model;
   }
+
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
   let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
-  if (req.stream) { url += "?alt=sse"; }
+  if (req.stream) {
+    url += "?alt=sse";
+  }
+
   const response = await fetch(url, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(await transformRequest(req)), // try
+    body: JSON.stringify(await transformRequest(req)),
   });
 
   let body = response.body;
   if (response.ok) {
-    let id = generateChatcmplId(); //"chatcmpl-8pMMaqXMK68B3nyDBrapTDrhkHBQK";
+    let id = generateChatcmplId();
     if (req.stream) {
       body = response.body
         .pipeThrough(new TextDecoderStream())
-        .pipeThrough(new TransformStream({
-          transform: parseStream,
-          flush: parseStreamFlush,
-          buffer: "",
-        }))
-        .pipeThrough(new TransformStream({
-          transform: toOpenAiStream,
-          flush: toOpenAiStreamFlush,
-          streamIncludeUsage: req.stream_options?.include_usage,
-          model, id, last: [],
-        }))
+        .pipeThrough(
+          new TransformStream({
+            transform: parseStream,
+            flush: parseStreamFlush,
+            buffer: "",
+          })
+        )
+        .pipeThrough(
+          new TransformStream({
+            transform: toOpenAiStream,
+            flush: toOpenAiStreamFlush,
+            streamIncludeUsage: req.stream_options?.include_usage,
+            model,
+            id,
+            last: [],
+          })
+        )
         .pipeThrough(new TextEncoderStream());
     } else {
       body = await response.text();
@@ -192,7 +202,7 @@ const harmCategory = [
   "HARM_CATEGORY_HARASSMENT",
   "HARM_CATEGORY_CIVIC_INTEGRITY",
 ];
-const safetySettings = harmCategory.map(category => ({
+const safetySettings = harmCategory.map((category) => ({
   category,
   threshold: "BLOCK_NONE",
 }));
@@ -217,14 +227,14 @@ const transformConfig = (req) => {
     }
   }
   if (req.response_format) {
-    switch(req.response_format.type) {
+    switch (req.response_format.type) {
       case "json_schema":
         cfg.responseSchema = req.response_format.json_schema?.schema;
         if (cfg.responseSchema && "enum" in cfg.responseSchema) {
           cfg.responseMimeType = "text/x.enum";
           break;
         }
-        // eslint-disable-next-line no-fallthrough
+      // eslint-disable-next-line no-fallthrough
       case "json_object":
         cfg.responseMimeType = "application/json";
         break;
@@ -291,21 +301,23 @@ const transformMsg = async ({ role, content }) => {
           inlineData: {
             mimeType: "audio/" + item.input_audio.format,
             data: item.input_audio.data,
-          }
+          },
         });
         break;
       default:
         throw new TypeError(`Unknown "content" item type: "${item.type}"`);
     }
   }
-  if (content.every(item => item.type === "image_url")) {
+  if (content.every((item) => item.type === "image_url")) {
     parts.push({ text: "" }); // to avoid "Unable to submit request because it must have a text parameter"
   }
   return { role, parts };
 };
 
 const transformMessages = async (messages) => {
-  if (!messages) { return; }
+  if (!messages) {
+    return;
+  }
   const contents = [];
   let system_instruction;
   for (const item of messages) {
@@ -325,23 +337,26 @@ const transformMessages = async (messages) => {
 };
 
 const transformRequest = async (req) => ({
-  ...await transformMessages(req.messages),
+  ...(await transformMessages(req.messages)),
   safetySettings,
   generationConfig: transformConfig(req),
 });
 
 const generateChatcmplId = () => {
-  const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  const randomChar = () => characters[Math.floor(Math.random() * characters.length)];
+  const characters =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const randomChar = () =>
+    characters[Math.floor(Math.random() * characters.length)];
   return "chatcmpl-" + Array.from({ length: 29 }, randomChar).join("");
 };
 
-const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse#finishreason
+const reasonsMap = {
+  //https://ai.google.dev/api/rest/v1/GenerateContentResponse#finishreason
   //"FINISH_REASON_UNSPECIFIED": // Default value. This value is unused.
-  "STOP": "stop",
-  "MAX_TOKENS": "length",
-  "SAFETY": "content_filter",
-  "RECITATION": "content_filter",
+  STOP: "stop",
+  MAX_TOKENS: "length",
+  SAFETY: "content_filter",
+  RECITATION: "content_filter",
   //"OTHER": "OTHER",
   // :"function_call",
 };
@@ -350,7 +365,8 @@ const transformCandidates = (key, cand) => ({
   index: cand.index || 0, // 0-index is absent in new -002 models response
   [key]: {
     role: "assistant",
-    content: cand.content?.parts.map(p => p.text).join(SEP) },
+    content: cand.content?.parts.map((p) => p.text).join(SEP),
+  },
   logprobs: null,
   finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
 });
@@ -360,14 +376,14 @@ const transformCandidatesDelta = transformCandidates.bind(null, "delta");
 const transformUsage = (data) => ({
   completion_tokens: data.candidatesTokenCount,
   prompt_tokens: data.promptTokenCount,
-  total_tokens: data.totalTokenCount
+  total_tokens: data.totalTokenCount,
 });
 
 const processCompletionsResponse = (data, model, id) => {
   return JSON.stringify({
     id,
     choices: data.candidates.map(transformCandidatesMessage),
-    created: Math.floor(Date.now()/1000),
+    created: Math.floor(Date.now() / 1000),
     model,
     //system_fingerprint: "fp_69829325d0",
     object: "chat.completion",
@@ -376,32 +392,44 @@ const processCompletionsResponse = (data, model, id) => {
 };
 
 const responseLineRE = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
-async function parseStream (chunk, controller) {
+async function parseStream(chunk, controller) {
   chunk = await chunk;
-  if (!chunk) { return; }
+  if (!chunk) {
+    return;
+  }
   this.buffer += chunk;
   do {
     const match = this.buffer.match(responseLineRE);
-    if (!match) { break; }
+    if (!match) {
+      break;
+    }
     controller.enqueue(match[1]);
     this.buffer = this.buffer.substring(match[0].length);
   } while (true); // eslint-disable-line no-constant-condition
 }
-async function parseStreamFlush (controller) {
+async function parseStreamFlush(controller) {
   if (this.buffer) {
     console.error("Invalid data:", this.buffer);
     controller.enqueue(this.buffer);
   }
 }
 
-function transformResponseStream (data, stop, first) {
+function transformResponseStream(data, stop, first) {
   const item = transformCandidatesDelta(data.candidates[0]);
-  if (stop) { item.delta = {}; } else { item.finish_reason = null; }
-  if (first) { item.delta.content = ""; } else { delete item.delta.role; }
+  if (stop) {
+    item.delta = {};
+  } else {
+    item.finish_reason = null;
+  }
+  if (first) {
+    item.delta.content = "";
+  } else {
+    delete item.delta.role;
+  }
   const output = {
     id: this.id,
     choices: [item],
-    created: Math.floor(Date.now()/1000),
+    created: Math.floor(Date.now() / 1000),
     model: this.model,
     //system_fingerprint: "fp_69829325d0",
     object: "chat.completion.chunk",
@@ -412,10 +440,12 @@ function transformResponseStream (data, stop, first) {
   return "data: " + JSON.stringify(output) + delimiter;
 }
 const delimiter = "\n\n";
-async function toOpenAiStream (chunk, controller) {
+async function toOpenAiStream(chunk, controller) {
   const transform = transformResponseStream.bind(this);
   const line = await chunk;
-  if (!line) { return; }
+  if (!line) {
+    return;
+  }
   let data;
   try {
     data = JSON.parse(line);
@@ -431,17 +461,22 @@ async function toOpenAiStream (chunk, controller) {
     data = { candidates };
   }
   const cand = data.candidates[0];
-  console.assert(data.candidates.length === 1, "Unexpected candidates count: %d", data.candidates.length);
+  console.assert(
+    data.candidates.length === 1,
+    "Unexpected candidates count: %d",
+    data.candidates.length
+  );
   cand.index = cand.index || 0; // absent in new -002 models response
   if (!this.last[cand.index]) {
     controller.enqueue(transform(data, false, "first"));
   }
   this.last[cand.index] = data;
-  if (cand.content) { // prevent empty data (e.g. when MAX_TOKENS)
+  if (cand.content) {
+    // prevent empty data (e.g. when MAX_TOKENS)
     controller.enqueue(transform(data));
   }
 }
-async function toOpenAiStreamFlush (controller) {
+async function toOpenAiStreamFlush(controller) {
   const transform = transformResponseStream.bind(this);
   if (this.last.length > 0) {
     for (const data of this.last) {
